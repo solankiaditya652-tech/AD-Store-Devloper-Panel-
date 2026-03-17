@@ -1,0 +1,1472 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>AD Store — Developer Console</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"/>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet"/>
+
+<script type="module">
+  // ============================================================
+  // FIREBASE CONFIG — Replace with your Firebase project config
+  // ============================================================
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+  import {
+    getAuth, onAuthStateChanged,
+    createUserWithEmailAndPassword,
+    signInWithEmailAndPassword,
+    updateProfile, signOut
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+  import {
+    getFirestore, collection, doc, getDoc, getDocs,
+    setDoc, addDoc, updateDoc, deleteDoc,
+    query, where, orderBy, serverTimestamp, onSnapshot
+  } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyB1T3dfytScHbCExSWQSj55wOCYo4LH6RE",
+    authDomain: "ad-store-4029b.firebaseapp.com",
+    databaseURL: "https://ad-store-4029b-default-rtdb.asia-southeast1.firebasedatabase.app",
+    projectId: "ad-store-4029b",
+    storageBucket: "ad-store-4029b.firebasestorage.app",
+    messagingSenderId: "541345400233",
+    appId: "1:541345400233:web:02bcc000031c199038f0b8"
+  };
+
+  // ============================================================
+  // IMAGEKIT CONFIG — Replace with your ImageKit credentials
+  // ============================================================
+  const IMAGEKIT_PUBLIC_KEY   = "public_HOfdjKxhKF66Sdtedfr3klSHb7Y=";
+  const IMAGEKIT_UPLOAD_URL   = "https://upload.imagekit.io/api/v1/files/upload";
+  // For client-side upload you need an auth endpoint OR use private key (dev only)
+  // Simple approach: use urlEndpoint + publicKey + token from your server
+  // For demo/dev: set IMAGEKIT_PRIVATE_KEY (NOT recommended for production)
+  const IMAGEKIT_PRIVATE_KEY  = "private_KLx7bAHSgy6qP/KVqMLuxxmoEX8="; // dev only
+  const IMAGEKIT_URL_ENDPOINT = "https://ik.imagekit.io/13m00qbq9";
+
+  const app  = initializeApp(firebaseConfig);
+  const auth = getAuth(app);
+  const db   = getFirestore(app);
+
+  // ============================================================
+  // STATE
+  // ============================================================
+  let currentUser  = null;
+  let currentRole  = null;
+  let myApps       = [];
+  let editingAppId = null;   // null = new app, string = edit mode
+  let unsubMyApps  = null;
+  let activeSection = 'dashboard';
+
+  // Existing URLs (kept if no new file selected in edit mode)
+  let existingIconUrl        = '';
+  let existingScreenshotUrls = [];
+  let existingApkUrl         = '';
+
+  // ============================================================
+  // UTILS
+  // ============================================================
+  const $ = id => document.getElementById(id);
+
+  function showToast(msg, type = 'success') {
+    const t = $('toast');
+    const icons = { success:'fa-circle-check', error:'fa-circle-exclamation', info:'fa-circle-info', warning:'fa-triangle-exclamation' };
+    const colors = { success:'bg-emerald-500', error:'bg-red-500', info:'bg-sky-500', warning:'bg-amber-500 text-slate-900' };
+    t.innerHTML = `<i class="fas ${icons[type]||icons.success} mr-2"></i>${msg}`;
+    t.className = `toast-base ${colors[type]||colors.success} text-white`;
+    t.style.opacity = '1'; t.style.transform = 'translateY(0)';
+    setTimeout(() => { t.style.opacity = '0'; t.style.transform = 'translateY(-12px)'; }, 3500);
+  }
+
+  function timeAgo(ts) {
+    if (!ts) return '—';
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    const diff = Date.now() - d.getTime();
+    const m = Math.floor(diff / 60000);
+    if (m < 1) return 'Just now';
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    return Math.floor(h / 24) + 'd ago';
+  }
+
+  function getInitials(name = '') {
+    return name.split(' ').map(w => w[0]).join('').toUpperCase().slice(0,2) || 'DV';
+  }
+
+  function setBtn(id, html, disabled = false) {
+    const el = $(id);
+    if (!el) return;
+    el.innerHTML = html;
+    el.disabled = disabled;
+  }
+
+  function showPage(page) {
+    ['login','register','panel','denied'].forEach(p => {
+      const el = $('page-' + p);
+      if (!el) return;
+      el.style.display = p === page ? '' : 'none';
+    });
+  }
+
+  // ============================================================
+  // IMAGE UPLOAD → ImageKit.io
+  // ============================================================
+  async function uploadToImageKit(file, fileName) {
+    // Build auth header (Basic base64(privateKey:))
+    const credentials = btoa(IMAGEKIT_PRIVATE_KEY + ':');
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('fileName', fileName || file.name);
+    formData.append('folder', '/adstore');
+
+    const res = await fetch(IMAGEKIT_UPLOAD_URL, {
+      method: 'POST',
+      headers: { 'Authorization': `Basic ${credentials}` },
+      body: formData
+    });
+
+    if (!res.ok) {
+      const err = await res.text();
+      throw new Error('ImageKit upload failed: ' + err);
+    }
+    const data = await res.json();
+    return data.url;
+  }
+
+  // ============================================================
+  // APK UPLOAD → GoFile.io
+  // ============================================================
+  async function uploadToGoFile(file) {
+    // Step 1: Get best server
+    const serverRes = await fetch('https://api.gofile.io/servers');
+    const serverData = await serverRes.json();
+    if (serverData.status !== 'ok') throw new Error('GoFile server fetch failed');
+    const server = serverData.data.servers[0].name;
+
+    // Step 2: Upload to that server
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const uploadRes = await fetch(`https://store${server}.gofile.io/uploadFile`, {
+      method: 'POST',
+      body: formData
+    });
+    const uploadData = await uploadRes.json();
+    if (uploadData.status !== 'ok') throw new Error('GoFile upload failed');
+
+    return uploadData.data.downloadPage; // public download link
+  }
+
+  // ============================================================
+  // UPLOAD PROGRESS UI
+  // ============================================================
+  function setProgress(id, pct, label) {
+    const wrap = $(id);
+    if (!wrap) return;
+    wrap.style.display = pct >= 0 ? 'block' : 'none';
+    const bar  = wrap.querySelector('.prog-bar');
+    const text = wrap.querySelector('.prog-text');
+    if (bar)  bar.style.width = pct + '%';
+    if (text) text.textContent = label || pct + '%';
+  }
+
+  // ============================================================
+  // AUTH
+  // ============================================================
+  async function doRegister() {
+    const name  = $('r-name').value.trim();
+    const email = $('r-email').value.trim();
+    const pass  = $('r-pass').value;
+    if (!name || !email || !pass) { showToast('All fields required', 'error'); return; }
+    if (pass.length < 6) { showToast('Password must be 6+ chars', 'error'); return; }
+
+    setBtn('reg-btn', '<i class="fas fa-spinner fa-spin mr-2"></i>Creating account...', true);
+    try {
+      const cred = await createUserWithEmailAndPassword(auth, email, pass);
+      await updateProfile(cred.user, { displayName: name });
+      await setDoc(doc(db, 'users', cred.user.uid), {
+        uid: cred.user.uid, name, email,
+        role: 'developer', createdAt: serverTimestamp()
+      });
+      showToast('Developer account created! 🎉');
+    } catch(e) {
+      showToast(e.message, 'error');
+      setBtn('reg-btn', '<i class="fas fa-rocket mr-2"></i>Create Developer Account', false);
+    }
+  }
+  window.doRegister = doRegister;
+
+  async function doLogin() {
+    const email = $('l-email').value.trim();
+    const pass  = $('l-pass').value;
+    if (!email || !pass) { showToast('Fill all fields', 'error'); return; }
+    setBtn('login-btn', '<i class="fas fa-spinner fa-spin mr-2"></i>Signing in...', true);
+    try {
+      await signInWithEmailAndPassword(auth, email, pass);
+    } catch(e) {
+      showToast(e.message, 'error');
+      setBtn('login-btn', '<i class="fas fa-sign-in-alt mr-2"></i>Sign In', false);
+    }
+  }
+  window.doLogin = doLogin;
+
+  async function doLogout() {
+    if (unsubMyApps) unsubMyApps();
+    await signOut(auth);
+  }
+  window.doLogout = doLogout;
+
+  // Page switch between login/register
+  window.showAuthPage = function(p) { showPage(p); };
+
+  // Enter key support
+  document.addEventListener('keydown', e => {
+    if (e.key !== 'Enter') return;
+    if ($('page-login').style.display !== 'none') doLogin();
+    else if ($('page-register').style.display !== 'none') doRegister();
+  });
+
+  // ============================================================
+  // SECTION SWITCH
+  // ============================================================
+  function switchSection(sec) {
+    activeSection = sec;
+    ['dashboard','upload','myapps'].forEach(s => {
+      $(`nav-${s}`)?.classList.toggle('nav-active', s === sec);
+      $(`section-${s}`)?.classList.toggle('hidden', s !== sec);
+    });
+    $('sidebar')?.classList.remove('sidebar-open');
+    if (sec === 'dashboard') renderDashboard();
+    if (sec === 'myapps')    renderMyApps();
+    if (sec === 'upload')    { resetForm(); $('section-title').textContent = 'Upload New App'; }
+    $('topbar-title').textContent = {
+      dashboard : 'Dashboard', upload : 'Upload App', myapps : 'My Apps'
+    }[sec] || 'Console';
+  }
+  window.switchSection = switchSection;
+  window.toggleSidebar = () => $('sidebar')?.classList.toggle('sidebar-open');
+
+  // ============================================================
+  // FIRESTORE LISTENER — my apps
+  // ============================================================
+  function listenMyApps(uid) {
+    const q = query(collection(db, 'apps'), where('developerId', '==', uid));
+    unsubMyApps = onSnapshot(q, snap => {
+      myApps = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+        .sort((a,b) => (b.createdAt?.seconds||0) - (a.createdAt?.seconds||0));
+      updateStats();
+      if (activeSection === 'dashboard') renderDashboard();
+      if (activeSection === 'myapps')    renderMyApps();
+    });
+  }
+
+  // ============================================================
+  // STATS
+  // ============================================================
+  function updateStats() {
+    const set = (id,v) => { const e=$(id); if(e) e.textContent=v; };
+    set('stat-total',    myApps.length);
+    set('stat-approved', myApps.filter(a=>a.status==='approved').length);
+    set('stat-pending',  myApps.filter(a=>a.status==='pending').length);
+    set('stat-rejected', myApps.filter(a=>a.status==='rejected').length);
+  }
+
+  // ============================================================
+  // RENDER DASHBOARD
+  // ============================================================
+  function renderDashboard() {
+    const el = $('dash-app-list');
+    if (!el) return;
+    const recent = myApps.slice(0,6);
+    el.innerHTML = recent.length ? recent.map(appRow).join('') :
+      `<div class="empty-state"><i class="fas fa-rocket"></i><p>No apps yet. Upload your first app!</p>
+       <button class="empty-upload-btn" onclick="window.switchSection('upload')"><i class="fas fa-plus mr-2"></i>Upload App</button></div>`;
+  }
+
+  function appRow(a) {
+    const statusCfg = {
+      pending  : { cls:'status-pending',  icon:'fa-hourglass-half', label:'Pending'  },
+      approved : { cls:'status-approved', icon:'fa-check-circle',   label:'Approved' },
+      rejected : { cls:'status-rejected', icon:'fa-times-circle',   label:'Rejected' }
+    };
+    const s = statusCfg[a.status] || statusCfg.pending;
+    return `
+    <div class="app-row">
+      <img src="${a.icon||'https://placehold.co/48x48/0f1923/334155?text='+encodeURIComponent((a.name||'A')[0])}"
+        class="app-row-icon" alt=""
+        onerror="this.src='https://placehold.co/48x48/0f1923/334155?text=${encodeURIComponent((a.name||'A')[0])}'"/>
+      <div class="app-row-info">
+        <p class="app-row-name">${a.name||'Untitled'}</p>
+        <p class="app-row-meta"><span class="cat-tag">${a.category||'—'}</span> v${a.version||'1.0'} · ${timeAgo(a.createdAt)}</p>
+      </div>
+      <span class="status-badge ${s.cls}"><i class="fas ${s.icon} mr-1"></i>${s.label}</span>
+      <div class="row-actions">
+        <button class="row-edit-btn" onclick="window.startEdit('${a.id}')" title="Edit"><i class="fas fa-pen"></i></button>
+        <button class="row-del-btn"  onclick="window.deleteApp('${a.id}','${(a.name||'').replace(/'/g,"\\'")}')"><i class="fas fa-trash"></i></button>
+      </div>
+    </div>`;
+  }
+
+  // ============================================================
+  // RENDER MY APPS
+  // ============================================================
+  function renderMyApps() {
+    const el = $('myapps-list');
+    if (!el) return;
+    el.innerHTML = myApps.length ? myApps.map(appCard).join('') :
+      `<div class="empty-state"><i class="fas fa-box-open"></i><p>No apps uploaded yet</p>
+       <button class="empty-upload-btn" onclick="window.switchSection('upload')"><i class="fas fa-plus mr-2"></i>Upload Your First App</button></div>`;
+  }
+
+  function appCard(a) {
+    const statusCfg = {
+      pending  : { cls:'status-pending',  label:'Pending Review' },
+      approved : { cls:'status-approved', label:'Live on Store'  },
+      rejected : { cls:'status-rejected', label:'Rejected'       }
+    };
+    const s = statusCfg[a.status] || statusCfg.pending;
+    return `
+    <div class="myapp-card">
+      <div class="myapp-card-top">
+        <img src="${a.icon||'https://placehold.co/56x56/0f1923/334155?text='+encodeURIComponent((a.name||'A')[0])}"
+          class="myapp-icon" alt=""
+          onerror="this.src='https://placehold.co/56x56/0f1923/334155?text=${encodeURIComponent((a.name||'A')[0])}'"/>
+        <div class="myapp-info">
+          <h3>${a.name||'Untitled'}</h3>
+          <p>${a.category||'—'} · v${a.version||'1.0'}</p>
+          <p style="font-size:11px;color:var(--text-3)">${timeAgo(a.createdAt)}</p>
+        </div>
+        <span class="status-badge ${s.cls} self-start">${s.label}</span>
+      </div>
+      ${a.description ? `<p class="myapp-desc">${a.description.slice(0,120)}${a.description.length>120?'…':''}</p>` : ''}
+      ${a.screenshots?.length ? `
+      <div class="myapp-ss-row">
+        ${a.screenshots.slice(0,3).map(s=>`<img src="${s}" class="myapp-ss" alt="" onerror="this.style.display='none'"/>`).join('')}
+      </div>` : ''}
+      <div class="myapp-actions">
+        <button class="btn-edit" onclick="window.startEdit('${a.id}')"><i class="fas fa-pen mr-2"></i>Edit</button>
+        ${a.apkUrl ? `<a href="${a.apkUrl}" target="_blank" class="btn-apk"><i class="fas fa-download mr-2"></i>APK</a>` : ''}
+        <button class="btn-del" onclick="window.deleteApp('${a.id}','${(a.name||'').replace(/'/g,"\\'")}')"><i class="fas fa-trash mr-2"></i>Delete</button>
+      </div>
+    </div>`;
+  }
+
+  // ============================================================
+  // UPLOAD / EDIT FORM
+  // ============================================================
+  function resetForm() {
+    editingAppId = null;
+    existingIconUrl = ''; existingScreenshotUrls = []; existingApkUrl = '';
+    ['f-name','f-version','f-description'].forEach(id => { const e=$(id); if(e) e.value=''; });
+    $('f-category') && ($('f-category').value = 'Games');
+    ['f-icon','f-screenshots','f-apk'].forEach(id => { const e=$(id); if(e) e.value=''; });
+    $('icon-preview-wrap').style.display   = 'none';
+    $('ss-preview-wrap').innerHTML         = '';
+    $('apk-name-display').textContent      = '';
+    setProgress('icon-progress', -1);
+    setProgress('apk-progress', -1);
+    $('edit-existing-info').style.display  = 'none';
+    $('submit-btn').innerHTML = '<i class="fas fa-cloud-upload-alt mr-2"></i>Submit for Review';
+  }
+
+  window.startEdit = function(appId) {
+    const a = myApps.find(x => x.id === appId);
+    if (!a) return;
+    switchSection('upload');
+    editingAppId = appId;
+    existingIconUrl        = a.icon || '';
+    existingScreenshotUrls = a.screenshots || [];
+    existingApkUrl         = a.apkUrl || '';
+
+    // Fill form
+    $('f-name').value        = a.name || '';
+    $('f-version').value     = a.version || '';
+    $('f-description').value = a.description || '';
+    $('f-category').value    = a.category || 'Games';
+    $('section-title').textContent = 'Edit App';
+    $('submit-btn').innerHTML = '<i class="fas fa-save mr-2"></i>Save Changes';
+
+    // Show existing info
+    $('edit-existing-info').style.display = 'block';
+    $('existing-icon-url').textContent    = existingIconUrl ? '✅ Icon uploaded' : '—';
+    $('existing-ss-count').textContent    = existingScreenshotUrls.length
+      ? `✅ ${existingScreenshotUrls.length} screenshot(s)` : '—';
+    $('existing-apk-url').textContent     = existingApkUrl ? '✅ APK uploaded' : '—';
+
+    if (existingIconUrl) {
+      $('icon-preview').src = existingIconUrl;
+      $('icon-preview-wrap').style.display = 'block';
+    }
+  };
+
+  window.deleteApp = async function(appId, name) {
+    if (!confirm(`Delete "${name}"? This cannot be undone.`)) return;
+    try {
+      await deleteDoc(doc(db, 'apps', appId));
+      showToast(`"${name}" deleted`, 'info');
+    } catch(e) { showToast(e.message, 'error'); }
+  };
+
+  // Icon preview
+  window.previewIcon = function() {
+    const file = $('f-icon').files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = e => {
+      $('icon-preview').src = e.target.result;
+      $('icon-preview-wrap').style.display = 'block';
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Screenshot preview
+  window.previewScreenshots = function() {
+    const files = Array.from($('f-screenshots').files);
+    const wrap  = $('ss-preview-wrap');
+    wrap.innerHTML = '';
+    files.forEach(f => {
+      const reader = new FileReader();
+      reader.onload = e => {
+        const img = document.createElement('img');
+        img.src = e.target.result;
+        img.className = 'ss-thumb';
+        wrap.appendChild(img);
+      };
+      reader.readAsDataURL(f);
+    });
+  };
+
+  // APK name display
+  window.showApkName = function() {
+    const file = $('f-apk').files[0];
+    $('apk-name-display').textContent = file ? file.name : '';
+  };
+
+  // ============================================================
+  // SUBMIT FORM
+  // ============================================================
+  window.submitApp = async function() {
+    const name    = $('f-name').value.trim();
+    const version = $('f-version').value.trim();
+    const cat     = $('f-category').value;
+    const desc    = $('f-description').value.trim();
+
+    if (!name || !version || !cat) {
+      showToast('Name, Version and Category are required', 'error'); return;
+    }
+
+    const iconFile  = $('f-icon').files[0];
+    const ssFiles   = Array.from($('f-screenshots').files);
+    const apkFile   = $('f-apk').files[0];
+
+    // For new app, icon + APK are required
+    if (!editingAppId) {
+      if (!iconFile) { showToast('App icon is required', 'error'); return; }
+      if (!apkFile)  { showToast('APK file is required', 'error'); return; }
+    }
+
+    setBtn('submit-btn', '<i class="fas fa-spinner fa-spin mr-2"></i>Uploading...', true);
+
+    try {
+      let iconUrl        = existingIconUrl;
+      let screenshotUrls = [...existingScreenshotUrls];
+      let apkUrl         = existingApkUrl;
+
+      // Upload icon
+      if (iconFile) {
+        setProgress('icon-progress', 10, 'Uploading icon…');
+        iconUrl = await uploadToImageKit(iconFile, `icon_${Date.now()}_${iconFile.name}`);
+        setProgress('icon-progress', 100, 'Icon uploaded ✅');
+      }
+
+      // Upload screenshots
+      if (ssFiles.length > 0) {
+        screenshotUrls = [];
+        for (let i = 0; i < ssFiles.length; i++) {
+          const pct = Math.round(((i+1)/ssFiles.length)*100);
+          setProgress('icon-progress', pct, `Uploading screenshot ${i+1}/${ssFiles.length}…`);
+          const url = await uploadToImageKit(ssFiles[i], `ss_${Date.now()}_${ssFiles[i].name}`);
+          screenshotUrls.push(url);
+        }
+        setProgress('icon-progress', 100, 'Screenshots uploaded ✅');
+      }
+
+      // Upload APK
+      if (apkFile) {
+        setProgress('apk-progress', 20, 'Uploading APK…');
+        apkUrl = await uploadToGoFile(apkFile);
+        setProgress('apk-progress', 100, 'APK uploaded ✅');
+      }
+
+      // Save to Firestore
+      const payload = {
+        name, version, category: cat, description: desc,
+        icon: iconUrl, screenshots: screenshotUrls, apkUrl,
+        developerId: currentUser.uid,
+        developerName: currentUser.displayName || currentUser.email,
+        status: editingAppId ? (myApps.find(a=>a.id===editingAppId)?.status || 'pending') : 'pending'
+      };
+
+      if (editingAppId) {
+        await updateDoc(doc(db, 'apps', editingAppId), { ...payload, updatedAt: serverTimestamp() });
+        showToast('App updated successfully ✅');
+      } else {
+        payload.createdAt = serverTimestamp();
+        await addDoc(collection(db, 'apps'), payload);
+        showToast('App submitted for review! 🚀');
+      }
+
+      setProgress('icon-progress', -1);
+      setProgress('apk-progress', -1);
+      switchSection('myapps');
+
+    } catch(e) {
+      showToast(e.message, 'error');
+      setProgress('icon-progress', -1);
+      setProgress('apk-progress', -1);
+    } finally {
+      setBtn('submit-btn',
+        editingAppId ? '<i class="fas fa-save mr-2"></i>Save Changes' :
+                       '<i class="fas fa-cloud-upload-alt mr-2"></i>Submit for Review',
+        false
+      );
+    }
+  };
+
+  // ============================================================
+  // AUTH STATE
+  // ============================================================
+  onAuthStateChanged(auth, async user => {
+    currentUser = user;
+    if (!user) { showPage('login'); return; }
+
+    // Role check
+    try {
+      const snap = await getDoc(doc(db, 'users', user.uid));
+      currentRole = snap.exists() ? snap.data().role : null;
+    } catch(e) { currentRole = null; }
+
+    if (currentRole !== 'developer' && currentRole !== 'admin') {
+      $('denied-email').textContent = user.email;
+      showPage('denied');
+      return;
+    }
+
+    // Setup panel
+    $('dev-name').textContent    = user.displayName || user.email;
+    $('dev-email').textContent   = user.email;
+    $('dev-avatar').textContent  = getInitials(user.displayName || user.email);
+    $('dev-role-badge').textContent = currentRole === 'admin' ? '⚡ Admin' : '👨‍💻 Developer';
+    showPage('panel');
+    listenMyApps(user.uid);
+    switchSection('dashboard');
+  });
+
+</script>
+
+<style>
+  :root {
+    --bg        : #080d14;
+    --bg-2      : #0c1220;
+    --bg-card   : #101826;
+    --bg-card2  : #131f30;
+    --border    : rgba(255,255,255,0.07);
+    --border2   : rgba(255,255,255,0.04);
+    --text-1    : #e2eaf5;
+    --text-2    : #7a93b4;
+    --text-3    : #3d5470;
+    --accent    : #22d3ee;
+    --accent2   : #818cf8;
+    --success   : #10b981;
+    --warning   : #f59e0b;
+    --danger    : #ef4444;
+    --sidebar-w : 250px;
+    --radius    : 16px;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'DM Sans', sans-serif;
+    background: var(--bg);
+    color: var(--text-1);
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ─── LOADING PAGE ─────────────────────────────── */
+  #page-loading {
+    position: fixed; inset: 0; z-index: 9999;
+    display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px;
+    background: var(--bg);
+  }
+  .load-ring {
+    width: 44px; height: 44px; border-radius: 50%;
+    border: 3px solid rgba(34,211,238,0.15);
+    border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .load-logo {
+    font-family: 'DM Sans',sans-serif; font-weight: 800; font-size: 22px;
+    background: linear-gradient(135deg,#22d3ee,#818cf8);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+
+  /* ─── AUTH PAGES ─────────────────────────────── */
+  .auth-page {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 20px;
+    background: radial-gradient(ellipse 70% 50% at 50% 0%, rgba(34,211,238,0.07), transparent),
+                var(--bg);
+  }
+  .auth-box {
+    width: 100%; max-width: 420px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 24px; padding: 36px 32px;
+    box-shadow: 0 40px 100px rgba(0,0,0,0.6);
+    animation: fadeUp 0.45s ease;
+  }
+  @keyframes fadeUp {
+    from { opacity:0; transform:translateY(24px); }
+    to   { opacity:1; transform:translateY(0); }
+  }
+  .auth-top {
+    display: flex; align-items: center; gap: 14px; margin-bottom: 28px;
+  }
+  .auth-icon-box {
+    width: 52px; height: 52px; border-radius: 15px; flex-shrink: 0;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 22px; color: #fff;
+  }
+  .auth-top-text h2 { font-size: 20px; font-weight: 800; }
+  .auth-top-text p  { font-size: 12px; color: var(--text-2); margin-top: 2px; }
+
+  .auth-label {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-3); margin-bottom: 6px;
+  }
+  .auth-input {
+    width: 100%; background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; color: var(--text-1);
+    font-family: 'DM Sans',sans-serif; font-size: 14px; outline: none;
+    transition: border-color 0.2s; margin-bottom: 14px;
+  }
+  .auth-input:focus { border-color: rgba(34,211,238,0.4); background: rgba(255,255,255,0.06); }
+  .auth-input::placeholder { color: var(--text-3); }
+  .auth-btn {
+    width: 100%; padding: 13px;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    color: #fff; border: none; border-radius: 12px;
+    font-family: 'DM Sans',sans-serif; font-size: 14px; font-weight: 700;
+    cursor: pointer; margin-top: 4px; transition: opacity 0.2s;
+  }
+  .auth-btn:hover { opacity: 0.92; }
+  .auth-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+  .auth-switch {
+    text-align: center; font-size: 13px; color: var(--text-2); margin-top: 18px;
+  }
+  .auth-switch span { color: var(--accent); cursor: pointer; font-weight: 600; }
+  .auth-switch span:hover { text-decoration: underline; }
+
+  /* ─── ACCESS DENIED ─────────────────────────────── */
+  #page-denied {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: radial-gradient(ellipse at 50% 0%, rgba(239,68,68,0.08), transparent 60%), var(--bg);
+    padding: 20px;
+  }
+  .denied-card {
+    max-width: 420px; width: 100%; text-align: center;
+    background: var(--bg-card); border: 1px solid rgba(239,68,68,0.2);
+    border-radius: 24px; padding: 48px 32px;
+    box-shadow: 0 40px 100px rgba(0,0,0,0.5);
+    animation: fadeUp 0.4s ease;
+  }
+  .denied-card .di { font-size: 52px; color: var(--danger); margin-bottom: 18px; }
+  .denied-card h2  { font-size: 24px; font-weight: 800; margin-bottom: 10px; }
+  .denied-card p   { font-size: 13px; color: var(--text-2); line-height: 1.6; }
+  #denied-email    { color: var(--accent); font-weight: 700; margin: 6px 0; }
+  .denied-logout-btn {
+    margin-top: 24px; padding: 12px 28px;
+    background: rgba(239,68,68,0.1); color: var(--danger);
+    border: 1px solid rgba(239,68,68,0.25); border-radius: 12px;
+    font-family: 'DM Sans',sans-serif; font-size: 13px; font-weight: 700;
+    cursor: pointer; transition: background 0.2s;
+  }
+  .denied-logout-btn:hover { background: rgba(239,68,68,0.2); }
+
+  /* ─── PANEL LAYOUT ─────────────────────────────── */
+  #page-panel { display: flex; min-height: 100vh; }
+
+  /* SIDEBAR */
+  #sidebar {
+    width: var(--sidebar-w); background: var(--bg-2);
+    border-right: 1px solid var(--border);
+    display: flex; flex-direction: column;
+    position: fixed; top:0; left:0; bottom:0; z-index: 200;
+    transform: translateX(-100%); transition: transform 0.3s ease;
+  }
+  @media(min-width:900px) {
+    #sidebar { transform: translateX(0) !important; }
+    .main-wrap { margin-left: var(--sidebar-w) !important; }
+    #mob-menu-btn { display: none !important; }
+    #sidebar-overlay { display: none !important; }
+  }
+  #sidebar.sidebar-open { transform: translateX(0); }
+  #sidebar-overlay {
+    display: none; position: fixed; inset:0; z-index:199;
+    background: rgba(0,0,0,0.55); backdrop-filter: blur(3px);
+  }
+  #sidebar.sidebar-open ~ #sidebar-overlay { display: block; }
+
+  .sb-brand {
+    padding: 22px 18px 18px;
+    border-bottom: 1px solid var(--border2);
+  }
+  .sb-brand-row { display: flex; align-items: center; gap: 10px; }
+  .sb-brand-icon {
+    width: 38px; height: 38px; border-radius: 11px; flex-shrink:0;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    display: flex; align-items:center; justify-content:center;
+    font-size: 16px; color:#fff;
+  }
+  .sb-brand-name { font-weight: 800; font-size: 16px; letter-spacing: -0.3px; }
+  .sb-brand-sub  { font-size: 10px; color: var(--text-3); font-weight: 700;
+    letter-spacing: 1px; text-transform: uppercase; margin-top: 2px; }
+
+  .sb-nav { flex:1; padding: 12px 10px; display: flex; flex-direction: column; gap: 2px; }
+  .sb-label {
+    font-size: 10px; font-weight: 800; letter-spacing: 1.2px; text-transform: uppercase;
+    color: var(--text-3); padding: 10px 10px 4px;
+  }
+  .nav-item {
+    display: flex; align-items: center; gap: 11px;
+    padding: 11px 12px; border-radius: 12px;
+    font-size: 14px; font-weight: 500; color: var(--text-2);
+    cursor: pointer; transition: all 0.2s;
+    border: 1px solid transparent;
+  }
+  .nav-item i { width: 16px; text-align: center; font-size: 13px; }
+  .nav-item:hover { background: rgba(255,255,255,0.04); color: var(--text-1); }
+  .nav-item.nav-active {
+    background: rgba(34,211,238,0.08); color: var(--accent);
+    border-color: rgba(34,211,238,0.14);
+  }
+  .nav-upload-btn {
+    margin: 8px 10px 0;
+    padding: 12px; border-radius: 12px;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    color: #fff; font-size: 13px; font-weight: 700;
+    cursor: pointer; border: none; font-family: 'DM Sans',sans-serif;
+    display: flex; align-items: center; justify-content: center; gap: 8px;
+    transition: opacity 0.2s;
+  }
+  .nav-upload-btn:hover { opacity: 0.9; }
+
+  .sb-user {
+    padding: 14px 16px; border-top: 1px solid var(--border2);
+    display: flex; align-items: center; gap: 10px;
+  }
+  #dev-avatar {
+    width: 38px; height: 38px; border-radius: 50%; flex-shrink: 0;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    display: flex; align-items:center; justify-content:center;
+    font-size: 14px; font-weight: 800; color: #fff;
+  }
+  .sb-user-info { flex:1; min-width:0; }
+  #dev-name  { font-size: 13px; font-weight: 700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #dev-email { font-size: 11px; color: var(--text-3); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #dev-role-badge {
+    font-size: 10px; font-weight: 700; letter-spacing: 0.3px;
+    color: var(--accent); background: rgba(34,211,238,0.1);
+    padding: 2px 7px; border-radius: 20px; margin-top: 2px; display: inline-block;
+  }
+  .sb-logout {
+    background: none; border: none; color: var(--text-3); cursor: pointer;
+    font-size: 15px; padding: 4px; transition: color 0.2s;
+  }
+  .sb-logout:hover { color: var(--danger); }
+
+  /* ─── MAIN ─────────────────────────────── */
+  .main-wrap {
+    flex:1; display:flex; flex-direction:column; margin-left:0;
+    transition: margin-left 0.3s; min-width:0;
+  }
+
+  /* TOPBAR */
+  .topbar {
+    position: sticky; top:0; z-index:100;
+    background: rgba(12,18,32,0.92); backdrop-filter: blur(18px);
+    border-bottom: 1px solid var(--border);
+    padding: 15px 24px; display: flex; align-items: center; gap: 14px;
+  }
+  #mob-menu-btn {
+    background:none; border:none; color:var(--text-2); font-size:18px;
+    cursor:pointer; padding:4px; display:flex; align-items:center;
+  }
+  #topbar-title { font-weight: 800; font-size: 18px; }
+  .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+  .topbar-new-btn {
+    padding: 8px 16px; border-radius: 10px;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    color: #fff; font-size: 13px; font-weight: 700;
+    border: none; cursor: pointer; display: flex; align-items: center; gap: 6px;
+    font-family: 'DM Sans',sans-serif; transition: opacity 0.2s;
+  }
+  .topbar-new-btn:hover { opacity: 0.9; }
+
+  /* ─── CONTENT ─────────────────────────────── */
+  .content { padding: 28px 24px; flex:1; max-width: 1100px; }
+
+  /* WELCOME BANNER */
+  .welcome-banner {
+    background: linear-gradient(135deg, rgba(14,165,233,0.12), rgba(129,140,248,0.12));
+    border: 1px solid rgba(34,211,238,0.15);
+    border-radius: 20px; padding: 24px 28px; margin-bottom: 28px;
+    display: flex; align-items: center; gap: 20px; position: relative; overflow: hidden;
+  }
+  .welcome-banner::before {
+    content: ''; position:absolute; top:-40px; right:-40px;
+    width: 160px; height: 160px; border-radius: 50%;
+    background: radial-gradient(circle, rgba(34,211,238,0.1), transparent 70%);
+  }
+  .welcome-banner h2 { font-size: 22px; font-weight: 800; margin-bottom: 4px; }
+  .welcome-banner p  { font-size: 13px; color: var(--text-2); }
+  .banner-icon { font-size: 40px; }
+
+  /* STAT CARDS */
+  .stats-row {
+    display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; margin-bottom: 28px;
+  }
+  @media(min-width:640px) { .stats-row { grid-template-columns: repeat(4,1fr); } }
+  .stat-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 18px 20px;
+    display: flex; align-items: center; gap: 14px;
+    transition: transform 0.2s, border-color 0.2s;
+  }
+  .stat-card:hover { transform: translateY(-2px); border-color: rgba(255,255,255,0.1); }
+  .stat-dot {
+    width: 46px; height: 46px; border-radius: 14px; flex-shrink:0;
+    display: flex; align-items:center; justify-content:center; font-size:18px;
+  }
+  .sd-cyan  { background: rgba(34,211,238,0.1); color: #22d3ee; }
+  .sd-green { background: rgba(16,185,129,0.1); color: #10b981; }
+  .sd-amber { background: rgba(245,158,11,0.1); color: #f59e0b; }
+  .sd-red   { background: rgba(239,68,68,0.1);  color: #ef4444; }
+  .stat-info { flex:1; }
+  .stat-val   { font-size: 28px; font-weight: 800; line-height:1; }
+  .stat-label { font-size: 12px; color: var(--text-2); margin-top: 3px; }
+
+  /* PANEL CARD */
+  .panel-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 20px; overflow: hidden; margin-bottom: 24px;
+  }
+  .panel-card-head {
+    padding: 16px 22px; border-bottom: 1px solid var(--border2);
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .panel-card-head h3 {
+    font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px;
+  }
+  .panel-card-head h3 i { color: var(--accent); font-size: 13px; }
+
+  /* APP ROW */
+  .app-row {
+    display: flex; align-items: center; gap: 14px;
+    padding: 14px 22px; border-bottom: 1px solid var(--border2);
+    transition: background 0.2s;
+  }
+  .app-row:last-child { border-bottom: none; }
+  .app-row:hover { background: rgba(255,255,255,0.02); }
+  .app-row-icon { width: 48px; height: 48px; border-radius: 12px; object-fit:cover; flex-shrink:0; }
+  .app-row-info { flex:1; min-width:0; }
+  .app-row-name { font-size: 14px; font-weight: 700; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .app-row-meta { font-size: 12px; color: var(--text-2); margin-top: 3px; display:flex; align-items:center; gap:6px; }
+  .cat-tag {
+    background: rgba(129,140,248,0.1); color: var(--accent2);
+    padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 700;
+  }
+  .row-actions { display: flex; gap: 6px; }
+  .row-edit-btn, .row-del-btn {
+    width: 32px; height: 32px; border-radius: 9px; border: none; cursor: pointer;
+    display: flex; align-items:center; justify-content:center; font-size: 12px;
+    transition: background 0.2s;
+  }
+  .row-edit-btn { background: rgba(34,211,238,0.08); color: var(--accent); }
+  .row-edit-btn:hover { background: rgba(34,211,238,0.18); }
+  .row-del-btn  { background: rgba(239,68,68,0.08); color: var(--danger); }
+  .row-del-btn:hover { background: rgba(239,68,68,0.18); }
+
+  /* STATUS BADGES */
+  .status-badge {
+    padding: 4px 10px; border-radius: 20px; font-size: 11px; font-weight: 700;
+    letter-spacing: 0.2px; white-space:nowrap; flex-shrink:0;
+  }
+  .status-pending  { background:rgba(245,158,11,0.12); color:#fbbf24; border:1px solid rgba(245,158,11,0.2); }
+  .status-approved { background:rgba(16,185,129,0.12); color:#34d399; border:1px solid rgba(16,185,129,0.2); }
+  .status-rejected { background:rgba(239,68,68,0.12);  color:#f87171; border:1px solid rgba(239,68,68,0.2); }
+
+  /* MY APPS GRID */
+  .myapps-grid {
+    display: grid; gap: 18px;
+    grid-template-columns: 1fr;
+  }
+  @media(min-width:680px) { .myapps-grid { grid-template-columns: 1fr 1fr; } }
+
+  .myapp-card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 20px; padding: 20px; transition: border-color 0.2s, transform 0.2s;
+    animation: fadeUp 0.3s ease;
+  }
+  .myapp-card:hover { border-color: rgba(255,255,255,0.1); transform: translateY(-2px); }
+  .myapp-card-top { display: flex; align-items: flex-start; gap: 14px; margin-bottom: 12px; }
+  .myapp-icon { width: 56px; height: 56px; border-radius: 15px; object-fit:cover; flex-shrink:0; }
+  .myapp-info { flex:1; min-width:0; }
+  .myapp-info h3 { font-size: 15px; font-weight: 800; margin-bottom: 4px; }
+  .myapp-info p  { font-size: 12px; color: var(--text-2); margin-bottom: 2px; }
+  .myapp-desc { font-size: 13px; color: var(--text-2); line-height: 1.55; margin-bottom: 12px; }
+  .myapp-ss-row { display: flex; gap: 8px; overflow-x:auto; margin-bottom:12px; scrollbar-width:none; }
+  .myapp-ss-row::-webkit-scrollbar { display:none; }
+  .myapp-ss { height: 90px; border-radius: 10px; flex-shrink:0; }
+  .myapp-actions { display: flex; gap: 8px; flex-wrap:wrap; }
+  .btn-edit {
+    padding: 8px 16px; border-radius: 10px;
+    background: rgba(34,211,238,0.08); color: var(--accent);
+    border: 1px solid rgba(34,211,238,0.2); font-size: 13px; font-weight: 700;
+    cursor: pointer; font-family:'DM Sans',sans-serif; transition: background 0.2s;
+  }
+  .btn-edit:hover { background: rgba(34,211,238,0.15); }
+  .btn-apk {
+    padding: 8px 16px; border-radius: 10px;
+    background: rgba(16,185,129,0.08); color: #10b981;
+    border: 1px solid rgba(16,185,129,0.2); font-size: 13px; font-weight: 700;
+    text-decoration: none; display: flex; align-items: center;
+    font-family:'DM Sans',sans-serif; transition: background 0.2s;
+  }
+  .btn-apk:hover { background: rgba(16,185,129,0.15); }
+  .btn-del {
+    padding: 8px 16px; border-radius: 10px;
+    background: rgba(239,68,68,0.08); color: var(--danger);
+    border: 1px solid rgba(239,68,68,0.2); font-size: 13px; font-weight: 700;
+    cursor: pointer; font-family:'DM Sans',sans-serif; transition: background 0.2s;
+    display: flex; align-items: center;
+  }
+  .btn-del:hover { background: rgba(239,68,68,0.16); }
+
+  /* ─── UPLOAD FORM ─────────────────────────────── */
+  .upload-form {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 22px; padding: 28px; max-width: 700px;
+    animation: fadeUp 0.3s ease;
+  }
+  .form-grid { display: grid; gap: 18px; }
+  .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media(max-width:540px) { .form-grid-2 { grid-template-columns: 1fr; } }
+
+  .form-group { display: flex; flex-direction: column; gap: 7px; }
+  .form-label {
+    font-size: 11px; font-weight: 800; letter-spacing: 0.8px;
+    text-transform: uppercase; color: var(--text-2);
+    display: flex; align-items: center; gap: 6px;
+  }
+  .form-label i { color: var(--accent); font-size: 11px; }
+  .form-required { color: var(--danger); font-size: 13px; }
+  .form-input, .form-select, .form-textarea {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 12px 14px; color: var(--text-1);
+    font-family: 'DM Sans',sans-serif; font-size: 14px; outline: none;
+    transition: border-color 0.2s, background 0.2s;
+  }
+  .form-input:focus, .form-select:focus, .form-textarea:focus {
+    border-color: rgba(34,211,238,0.4); background: rgba(255,255,255,0.06);
+  }
+  .form-input::placeholder, .form-textarea::placeholder { color: var(--text-3); }
+  .form-select option { background: #101826; }
+  .form-textarea { resize: vertical; min-height: 100px; }
+
+  /* File upload zones */
+  .file-zone {
+    border: 2px dashed var(--border); border-radius: 14px;
+    padding: 20px; text-align: center; cursor: pointer;
+    transition: border-color 0.2s, background 0.2s; position: relative;
+  }
+  .file-zone:hover { border-color: rgba(34,211,238,0.35); background: rgba(34,211,238,0.03); }
+  .file-zone input[type="file"] {
+    position: absolute; inset:0; opacity:0; cursor:pointer; width:100%; height:100%;
+  }
+  .file-zone-icon { font-size: 28px; color: var(--text-3); margin-bottom: 8px; }
+  .file-zone-label { font-size: 13px; color: var(--text-2); font-weight: 600; }
+  .file-zone-sub   { font-size: 11px; color: var(--text-3); margin-top: 4px; }
+
+  /* Icon preview */
+  #icon-preview-wrap { display:none; margin-top:10px; }
+  #icon-preview { width: 72px; height: 72px; border-radius: 16px; object-fit:cover; border: 2px solid var(--border); }
+
+  /* Screenshot thumbs */
+  #ss-preview-wrap { display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
+  .ss-thumb { width: 80px; height: 60px; border-radius: 8px; object-fit:cover; border:1px solid var(--border); }
+
+  /* APK name */
+  #apk-name-display {
+    margin-top: 8px; font-size: 12px; color: var(--accent);
+    font-family: 'JetBrains Mono', monospace; word-break: break-all;
+  }
+
+  /* Progress bar */
+  .prog-wrap { margin-top: 8px; display:none; }
+  .prog-bar-bg {
+    height: 6px; background: rgba(255,255,255,0.07); border-radius: 99px; overflow:hidden;
+  }
+  .prog-bar {
+    height: 100%; background: linear-gradient(90deg,#0ea5e9,#818cf8);
+    border-radius: 99px; width: 0%; transition: width 0.4s ease;
+  }
+  .prog-text { font-size: 11px; color: var(--accent); margin-top: 4px; }
+
+  /* Existing info box */
+  #edit-existing-info {
+    display: none;
+    background: rgba(34,211,238,0.05); border: 1px solid rgba(34,211,238,0.15);
+    border-radius: 12px; padding: 14px 16px; margin-bottom: 4px;
+  }
+  #edit-existing-info h4 { font-size: 12px; font-weight: 800; color: var(--accent); margin-bottom: 8px; letter-spacing: 0.5px; text-transform:uppercase; }
+  .existing-row { font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
+  .existing-row strong { color: var(--text-1); }
+
+  /* Form divider */
+  .form-divider {
+    border: none; border-top: 1px solid var(--border2); margin: 4px 0;
+  }
+
+  /* Submit btn */
+  #submit-btn {
+    width: 100%; padding: 14px;
+    background: linear-gradient(135deg,#0ea5e9,#818cf8);
+    color: #fff; border: none; border-radius: 14px;
+    font-family: 'DM Sans',sans-serif; font-size: 15px; font-weight: 800;
+    cursor: pointer; transition: opacity 0.2s; margin-top: 8px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #submit-btn:hover { opacity: 0.9; }
+  #submit-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+
+  /* SECTION HEADER */
+  .section-header { margin-bottom: 22px; }
+  .section-header h2 { font-size: 24px; font-weight: 800; margin-bottom: 4px; }
+  .section-header p  { font-size: 13px; color: var(--text-2); }
+
+  /* Empty state */
+  .empty-state {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; padding: 60px 20px; color: var(--text-3);
+  }
+  .empty-state i { font-size: 44px; }
+  .empty-state p { font-size: 14px; }
+  .empty-upload-btn {
+    padding: 10px 22px; border-radius: 12px;
+    background: rgba(34,211,238,0.1); color: var(--accent);
+    border: 1px solid rgba(34,211,238,0.2); font-size: 13px; font-weight: 700;
+    cursor: pointer; font-family:'DM Sans',sans-serif; transition: background 0.2s;
+    display: flex; align-items: center;
+  }
+  .empty-upload-btn:hover { background: rgba(34,211,238,0.18); }
+
+  /* TOAST */
+  .toast-base {
+    position: fixed; top: 20px; left:50%; transform: translateX(-50%) translateY(-12px);
+    z-index: 9999; padding: 11px 20px; border-radius: 14px;
+    font-size: 13px; font-weight: 700; opacity: 0;
+    display: flex; align-items: center;
+    transition: all 0.3s; pointer-events: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    white-space: nowrap;
+  }
+  @media(min-width:600px) { .toast-base { left: auto; right: 24px; transform: translateY(-12px); } }
+
+  /* scrollbar */
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.08); border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<!-- TOAST -->
+<div id="toast" class="toast-base"></div>
+
+<!-- ── PAGE: LOADING ───────────────────────────── -->
+<div id="page-loading">
+  <div class="load-logo">AD Store Dev</div>
+  <div class="load-ring"></div>
+</div>
+
+<!-- ── PAGE: LOGIN ───────────────────────────── -->
+<div id="page-login" style="display:none">
+  <div class="auth-page">
+    <div class="auth-box">
+      <div class="auth-top">
+        <div class="auth-icon-box"><i class="fas fa-code"></i></div>
+        <div class="auth-top-text">
+          <h2>Developer Sign In</h2>
+          <p>Access your AD Store console</p>
+        </div>
+      </div>
+      <div class="form-label">Email Address</div>
+      <input id="l-email" class="auth-input" type="email" placeholder="you@example.com" autocomplete="email"/>
+      <div class="form-label">Password</div>
+      <input id="l-pass" class="auth-input" type="password" placeholder="••••••••" autocomplete="current-password"/>
+      <button id="login-btn" class="auth-btn" onclick="window.doLogin()">
+        <i class="fas fa-sign-in-alt mr-2"></i>Sign In
+      </button>
+      <p class="auth-switch">New developer? <span onclick="window.showAuthPage('register')">Create account</span></p>
+    </div>
+  </div>
+</div>
+
+<!-- ── PAGE: REGISTER ───────────────────────────── -->
+<div id="page-register" style="display:none">
+  <div class="auth-page">
+    <div class="auth-box">
+      <div class="auth-top">
+        <div class="auth-icon-box"><i class="fas fa-rocket"></i></div>
+        <div class="auth-top-text">
+          <h2>Join as Developer</h2>
+          <p>Publish apps on AD Store</p>
+        </div>
+      </div>
+      <div class="form-label">Full Name</div>
+      <input id="r-name"  class="auth-input" type="text"     placeholder="Your name" autocomplete="name"/>
+      <div class="form-label">Email Address</div>
+      <input id="r-email" class="auth-input" type="email"    placeholder="you@example.com" autocomplete="email"/>
+      <div class="form-label">Password</div>
+      <input id="r-pass"  class="auth-input" type="password" placeholder="Min 6 characters" autocomplete="new-password"/>
+      <button id="reg-btn" class="auth-btn" onclick="window.doRegister()">
+        <i class="fas fa-rocket mr-2"></i>Create Developer Account
+      </button>
+      <p class="auth-switch">Already registered? <span onclick="window.showAuthPage('login')">Sign in</span></p>
+    </div>
+  </div>
+</div>
+
+<!-- ── PAGE: ACCESS DENIED ───────────────────────────── -->
+<div id="page-denied" style="display:none">
+  <div class="denied-card">
+    <div class="di"><i class="fas fa-ban"></i></div>
+    <h2>Access Denied</h2>
+    <p>Logged in as</p>
+    <p id="denied-email">—</p>
+    <p style="margin-top:8px">This account is not registered as a developer.<br/>Please register a new developer account.</p>
+    <button class="denied-logout-btn" onclick="window.doLogout()">
+      <i class="fas fa-sign-out-alt mr-2"></i>Logout & Switch Account
+    </button>
+  </div>
+</div>
+
+<!-- ── PAGE: PANEL ───────────────────────────── -->
+<div id="page-panel" style="display:none;min-height:100vh;">
+
+  <!-- Sidebar overlay -->
+  <div id="sidebar-overlay" onclick="window.toggleSidebar()"></div>
+
+  <!-- SIDEBAR -->
+  <aside id="sidebar">
+    <div class="sb-brand">
+      <div class="sb-brand-row">
+        <div class="sb-brand-icon"><i class="fas fa-store"></i></div>
+        <div>
+          <div class="sb-brand-name">AD Store</div>
+          <div class="sb-brand-sub">Dev Console</div>
+        </div>
+      </div>
+    </div>
+
+    <nav class="sb-nav">
+      <div class="sb-label">Navigation</div>
+      <div class="nav-item nav-active" id="nav-dashboard" onclick="window.switchSection('dashboard')">
+        <i class="fas fa-chart-pie"></i> Dashboard
+      </div>
+      <div class="nav-item" id="nav-myapps" onclick="window.switchSection('myapps')">
+        <i class="fas fa-layer-group"></i> My Apps
+      </div>
+      <div class="nav-item" id="nav-upload" onclick="window.switchSection('upload')">
+        <i class="fas fa-cloud-upload-alt"></i> Upload App
+      </div>
+
+      <button class="nav-upload-btn" style="margin-top:auto" onclick="window.switchSection('upload')">
+        <i class="fas fa-plus"></i> New App
+      </button>
+    </nav>
+
+    <div class="sb-user">
+      <div id="dev-avatar">DV</div>
+      <div class="sb-user-info">
+        <div id="dev-name">Developer</div>
+        <div id="dev-email">—</div>
+        <div id="dev-role-badge">👨‍💻 Developer</div>
+      </div>
+      <button class="sb-logout" onclick="window.doLogout()" title="Logout">
+        <i class="fas fa-sign-out-alt"></i>
+      </button>
+    </div>
+  </aside>
+
+  <!-- MAIN WRAP -->
+  <div class="main-wrap" style="display:flex;flex-direction:column;">
+
+    <!-- TOPBAR -->
+    <div class="topbar">
+      <button id="mob-menu-btn" onclick="window.toggleSidebar()"><i class="fas fa-bars"></i></button>
+      <span id="topbar-title" style="font-weight:800;font-size:18px;">Dashboard</span>
+      <div class="topbar-right">
+        <button class="topbar-new-btn" onclick="window.switchSection('upload')">
+          <i class="fas fa-plus"></i> New App
+        </button>
+      </div>
+    </div>
+
+    <!-- CONTENT -->
+    <div class="content">
+
+      <!-- ════ DASHBOARD ════ -->
+      <div id="section-dashboard">
+        <div class="welcome-banner">
+          <div class="banner-icon">👨‍💻</div>
+          <div>
+            <h2>Welcome to your Console</h2>
+            <p>Manage, upload, and track your apps on AD Store.</p>
+          </div>
+        </div>
+
+        <div class="stats-row">
+          <div class="stat-card">
+            <div class="stat-dot sd-cyan"><i class="fas fa-layer-group"></i></div>
+            <div class="stat-info">
+              <div class="stat-val" id="stat-total">0</div>
+              <div class="stat-label">Total Apps</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-dot sd-green"><i class="fas fa-circle-check"></i></div>
+            <div class="stat-info">
+              <div class="stat-val" id="stat-approved">0</div>
+              <div class="stat-label">Live Apps</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-dot sd-amber"><i class="fas fa-hourglass-half"></i></div>
+            <div class="stat-info">
+              <div class="stat-val" id="stat-pending">0</div>
+              <div class="stat-label">In Review</div>
+            </div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-dot sd-red"><i class="fas fa-circle-xmark"></i></div>
+            <div class="stat-info">
+              <div class="stat-val" id="stat-rejected">0</div>
+              <div class="stat-label">Rejected</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-card">
+          <div class="panel-card-head">
+            <h3><i class="fas fa-clock-rotate-left"></i> Recent Apps</h3>
+            <span style="font-size:12px;color:var(--text-3);cursor:pointer" onclick="window.switchSection('myapps')">View all →</span>
+          </div>
+          <div id="dash-app-list">
+            <div class="empty-state"><i class="fas fa-rocket"></i><p>No apps yet</p></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- ════ MY APPS ════ -->
+      <div id="section-myapps" class="hidden">
+        <div class="section-header">
+          <h2>My Apps</h2>
+          <p>All apps you've submitted to AD Store.</p>
+        </div>
+        <div class="myapps-grid" id="myapps-list">
+          <div class="empty-state"><i class="fas fa-box-open"></i><p>No apps yet</p></div>
+        </div>
+      </div>
+
+      <!-- ════ UPLOAD / EDIT ════ -->
+      <div id="section-upload" class="hidden">
+        <div class="section-header">
+          <h2 id="section-title">Upload New App</h2>
+          <p>Fill in the details. Your app will be reviewed before going live.</p>
+        </div>
+
+        <div class="upload-form">
+
+          <!-- Existing info (edit mode) -->
+          <div id="edit-existing-info">
+            <h4>📂 Existing Files</h4>
+            <div class="existing-row">Icon: <strong id="existing-icon-url">—</strong></div>
+            <div class="existing-row">Screenshots: <strong id="existing-ss-count">—</strong></div>
+            <div class="existing-row">APK: <strong id="existing-apk-url">—</strong></div>
+            <p style="font-size:11px;color:var(--text-3);margin-top:8px">
+              Leave file inputs empty to keep existing files. Select new files to replace them.
+            </p>
+          </div>
+
+          <div class="form-grid">
+
+            <!-- Row 1: Name + Version -->
+            <div class="form-grid-2">
+              <div class="form-group">
+                <label class="form-label"><i class="fas fa-pen"></i> App Name <span class="form-required">*</span></label>
+                <input id="f-name" class="form-input" type="text" placeholder="My Awesome App" maxlength="60"/>
+              </div>
+              <div class="form-group">
+                <label class="form-label"><i class="fas fa-code-branch"></i> Version <span class="form-required">*</span></label>
+                <input id="f-version" class="form-input" type="text" placeholder="1.0.0" maxlength="20"/>
+              </div>
+            </div>
+
+            <!-- Category -->
+            <div class="form-group">
+              <label class="form-label"><i class="fas fa-tag"></i> Category <span class="form-required">*</span></label>
+              <select id="f-category" class="form-select">
+                <option value="Games">🎮 Games</option>
+                <option value="Productivity">💼 Productivity</option>
+                <option value="Social">💬 Social</option>
+                <option value="Education">📚 Education</option>
+                <option value="Tools">🔧 Tools</option>
+                <option value="Entertainment">🎬 Entertainment</option>
+              </select>
+            </div>
+
+            <!-- Description -->
+            <div class="form-group">
+              <label class="form-label"><i class="fas fa-align-left"></i> Description</label>
+              <textarea id="f-description" class="form-textarea" placeholder="Describe your app — features, use case, what makes it special..." maxlength="1000"></textarea>
+            </div>
+
+            <hr class="form-divider"/>
+
+            <!-- Icon Upload -->
+            <div class="form-group">
+              <label class="form-label"><i class="fas fa-image"></i> App Icon
+                <span id="icon-req-star" class="form-required">*</span>
+                <span style="font-size:10px;color:var(--text-3);font-weight:normal;text-transform:none;letter-spacing:0"> (PNG/JPG, 512×512 recommended)</span>
+              </label>
+              <div class="file-zone">
+                <input type="file" id="f-icon" accept="image/*" onchange="window.previewIcon()"/>
+                <div class="file-zone-icon"><i class="fas fa-image"></i></div>
+                <div class="file-zone-label">Click to upload icon</div>
+                <div class="file-zone-sub">PNG, JPG, WebP · Max 5MB</div>
+              </div>
+              <div id="icon-preview-wrap"><img id="icon-preview" src="" alt="Icon Preview"/></div>
+              <div id="icon-progress" class="prog-wrap">
+                <div class="prog-bar-bg"><div class="prog-bar"></div></div>
+                <div class="prog-text"></div>
+              </div>
+            </div>
+
+            <!-- Screenshots Upload -->
+            <div class="form-group">
+              <label class="form-label"><i class="fas fa-images"></i> Screenshots
+                <span style="font-size:10px;color:var(--text-3);font-weight:normal;text-transform:none;letter-spacing:0"> (optional, up to 5)</span>
+              </label>
+              <div class="file-zone">
+                <input type="file" id="f-screenshots" accept="image/*" multiple onchange="window.previewScreenshots()"/>
+                <div class="file-zone-icon"><i class="fas fa-images"></i></div>
+                <div class="file-zone-label">Click to upload screenshots</div>
+                <div class="file-zone-sub">PNG, JPG, WebP · Max 5 images</div>
+              </div>
+              <div id="ss-preview-wrap"></div>
+            </div>
+
+            <hr class="form-divider"/>
+
+            <!-- APK Upload -->
+            <div class="form-group">
+              <label class="form-label"><i class="fas fa-file-zipper"></i> APK / App File
+                <span id="apk-req-star" class="form-required">*</span>
+                <span style="font-size:10px;color:var(--text-3);font-weight:normal;text-transform:none;letter-spacing:0"> (uploaded to GoFile.io)</span>
+              </label>
+              <div class="file-zone">
+                <input type="file" id="f-apk" accept=".apk,.zip,.ipa" onchange="window.showApkName()"/>
+                <div class="file-zone-icon"><i class="fas fa-file-zipper"></i></div>
+                <div class="file-zone-label">Click to upload APK / ZIP</div>
+                <div class="file-zone-sub">.apk, .zip, .ipa · Any size</div>
+              </div>
+              <div id="apk-name-display"></div>
+              <div id="apk-progress" class="prog-wrap">
+                <div class="prog-bar-bg"><div class="prog-bar"></div></div>
+                <div class="prog-text"></div>
+              </div>
+            </div>
+
+            <!-- Submit -->
+            <button id="submit-btn" onclick="window.submitApp()">
+              <i class="fas fa-cloud-upload-alt mr-2"></i>Submit for Review
+            </button>
+
+          </div><!-- /form-grid -->
+        </div><!-- /upload-form -->
+      </div><!-- /section-upload -->
+
+    </div><!-- /content -->
+  </div><!-- /main-wrap -->
+</div><!-- /page-panel -->
+
+<script>
+  // ─── Page visibility init ─────────────────────────
+  // Start with loading visible, all others hidden
+  ['login','register','panel','denied'].forEach(p => {
+    const el = document.getElementById('page-' + p);
+    if (el) el.style.display = 'none';
+  });
+  document.getElementById('page-loading').style.display = 'flex';
+
+  // After Firebase auth state resolves, loading hides.
+  // We patch the module's showPage by watching page-loading removal.
+  const loadEl = document.getElementById('page-loading');
+  // Hide loading once any page becomes visible
+  const panelEl   = document.getElementById('page-panel');
+  const loginEl   = document.getElementById('page-login');
+  const deniedEl  = document.getElementById('page-denied');
+  const regEl     = document.getElementById('page-register');
+
+  // The module calls showPage() which we exposed as window.showPage.
+  // Patch it after module load:
+  let _patchInterval = setInterval(() => {
+    // Check if any page is visible (auth resolved)
+    const anyVisible = [panelEl,loginEl,deniedEl].some(el => el && el.style.display !== 'none');
+    if (anyVisible) {
+      loadEl.style.display = 'none';
+      clearInterval(_patchInterval);
+    }
+  }, 100);
+
+  // Panel display fix
+  new MutationObserver(() => {
+    if (panelEl && !panelEl.classList.contains('hidden') && panelEl.style.display === 'none') {
+      panelEl.style.display = 'flex';
+    }
+  }).observe(panelEl || document.body, { attributes:true, attributeFilter:['style','class'] });
+
+  // Progress helper exposed globally
+  window.setProgress = function(id, pct, label) {
+    const wrap = document.getElementById(id);
+    if (!wrap) return;
+    wrap.style.display = pct >= 0 ? 'block' : 'none';
+    const bar  = wrap.querySelector('.prog-bar');
+    const text = wrap.querySelector('.prog-text');
+    if (bar)  bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+    if (text) text.textContent = label || pct + '%';
+  };
+</script>
+
+</body>
+</html>
